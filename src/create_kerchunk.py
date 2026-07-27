@@ -39,7 +39,8 @@ import h5py
 os.environ["HDF5_USE_FILE_LOCKING"] = "FALSE"
 
 # --- h5py monkeypatch: check fill-value status directly, never trigger the exception.
-# This patch must be applied before importing kerchunk.   ---
+# This patch must be applied before importing kerchunk.  It is needed because h5py
+# expects coordinate dimensions to have a "fillValue", and IMERG data files do not. ---
 _orig_fillvalue = h5py.Dataset.fillvalue.fget
 
 def _safe_fillvalue(self):
@@ -60,22 +61,7 @@ from kerchunk.netCDF3 import NetCDF3ToZarr
 
 import helpers
 
-
-
 ### Global settings
-
-# --- monkeypatch for h5py: apply once, before any kerchunk imports ---
-_orig_fillvalue = h5py.Dataset.fillvalue.fget
-
-def _safe_fillvalue(self):
-    try:
-        return _orig_fillvalue(self)
-    except RuntimeError:
-        return None
-
-h5py.Dataset.fillvalue = property(_safe_fillvalue)
-# -----------------------------------------------------------
-
 
 # special keyword to indicate all variables should be separated
 ALL_VARIABLES_KEYWORD = "ALL"
