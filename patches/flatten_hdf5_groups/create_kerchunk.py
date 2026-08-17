@@ -18,6 +18,7 @@ Test command:
     python create_kerchunk.py --action combine --directory /gdex/data/d640000/bnd_ocean/194907 --output_directory /glade/u/home/chiaweih/Kerchunk_experiments/test_json --extensions nc --filename combined_kerchunk.json 
     python create_kerchunk.py --action combine --directory /glade/campaign/collections/gdex/data/d640000/bnd_ocean/194907 --output_directory /glade/u/home/chiaweih/Kerchunk_experiments/test_json --extensions nc --filename bnd_ocean.194907.parq --output_format parquet --make_remote
     python create_kerchunk.py --action combine --concat_new_dim ensemble --directory /glade/campaign/collections/gdex/data/d651039/ukesm1-0-ll_lens/OImon/siconc  --filename ukesm1-0-ll-lens_OImon_siconc_historical.json  --output_directory ~/scratch/MMLEA_test --regex "_ssp370_"   --cluster single        
+    python create_kerchunk.py --action combine --h5_coord_group Grid --directory /glade/campaign/collections/gdex/data/d736000/gpm_3imergm_v07/2016 
     
 """
 
@@ -33,6 +34,24 @@ import re
 import time
 import dask
 import h5py
+
+
+os.environ["HDF5_USE_FILE_LOCKING"] = "FALSE"
+
+# --- h5py monkeypatch: check fill-value status directly, never trigger the exception.
+# This patch must be applied before importing kerchunk.  It is needed because h5py
+# expects coordinate dimensions to have a "fillValue", and IMERG data files do not. ---
+_orig_fillvalue = h5py.Dataset.fillvalue.fget
+
+def _safe_fillvalue(self):
+    status = self.id.get_create_plist().fill_value_defined()
+    if status == 0:  # h5py's h5d.FILL_VALUE_UNDEFINED
+        return None
+    return _orig_fillvalue(self)
+
+h5py.Dataset.fillvalue = property(_safe_fillvalue)
+# -----------------------------------------------------------
+
 from dask_jobqueue import PBSCluster
 from dask.distributed import LocalCluster
 from fsspec.implementations.local import LocalFileSystem
@@ -40,7 +59,7 @@ import kerchunk.hdf
 from kerchunk.combine import MultiZarrToZarr
 from kerchunk.netCDF3 import NetCDF3ToZarr
 
-import concat_dim
+import helpers
 
 ### Global settings
 
@@ -144,6 +163,17 @@ def _get_parser():
         default=[]
     )
     parser.add_argument(
+        '--h5_coord_group', '-h5',
+        type=str,
+        default='',
+        required=False,
+        nargs=None,
+        metavar='<group name>',
+        help="""Use if important coordinates (time, lat, lon) exist 
+        in a group.  Specify the group name.
+        """
+    )
+    parser.add_argument(
         '--cluster', '-c',
         type=str,
         default="local",
@@ -221,13 +251,6 @@ def _get_parser():
         metavar='<variable names>',
         help="Exclude specific variables from the combined kerchunk file. Variable names are case sensitive.",
         default=[]
-    )
-
-    parser.add_argument(
-        '--parquet_path_no_cat',
-        action='store_true',
-        default=False,
-        help="Disable category encoding for the path column in parquet output to avoid NaN in path column.",
     )
 
     return parser
@@ -506,7 +529,7 @@ def exclude_files(
     return included_files
 
 
-def get_time_variable(filename):
+def get_time_variable(filename, h5_coord_group=None):
     """Get time variable name in the file
     Will try different methods for finding lat in decreasing authority.
 
@@ -521,23 +544,24 @@ def get_time_variable(filename):
         name of time variable if found, else None (need to check manually)
     """
     import xarray
-    ds = xarray.open_dataset(filename)
+    if not h5_coord_group:
+        ds = xarray.open_dataset(filename)
+        h5_prefix = ''
+    else:
+        ds = xarray.open_dataset(filename, group=h5_coord_group)
+        h5_prefix = f"{h5_coord_group}/"
 
+    result=None
     for key, value in ds.coords.items():
-        if 'standard_name' in value.attrs and value.attrs['standard_name'] == 'time':
-            return key
-        if 'standard_name' in value.attrs and value.attrs['standard_name'] == 'forecast_reference_time':
-            return key
-        if 'long_name' in value.attrs and value.attrs['long_name'] == 'time':
-            return key
-        if 'short_name' in value.attrs and value.attrs['short_name'] == 'time':
-            return key
-        if key.lower() == 'time':
-            return key
-        if 'units' in value.attrs and 'minutes since' in value.attrs['units']:
-            return key
+        if (('standard_name' in value.attrs and value.attrs['standard_name'] == 'time') or 
+            ('standard_name' in value.attrs and value.attrs['standard_name'] == 'forecast_reference_time') or
+            ('long_name' in value.attrs and value.attrs['long_name'] == 'time') or
+            ('short_name' in value.attrs and value.attrs['short_name'] == 'time') or
+            (key.lower() == 'time') or 
+            ('units' in value.attrs and 'minutes since' in value.attrs['units'])):
+                result = f"{h5_prefix}{key}"
 
-    return None
+    return result
 
 
 def separate_vars(refs, var_names):
@@ -631,7 +655,7 @@ def calculate_parquet_record_size(refs_dict, min_size=10_000):
     return max(min_size, num_refs)
 
 
-def write_combined_kerchunk(output_directory, multi_kerchunk, regex=None, output_filename="",output_format="json", make_remote=False, parquet_path_no_cat=False):
+def write_combined_kerchunk(output_directory, multi_kerchunk, regex=None, output_filename="",output_format="json", make_remote=False):
     """Write kerchunk .json for combined kerchunk.
 
     Args:
@@ -681,18 +705,12 @@ def write_combined_kerchunk(output_directory, multi_kerchunk, regex=None, output
         # Expand templates here before writing.
         record_size = calculate_parquet_record_size(multi_kerchunk)
         print(f'Parquet record_size: {record_size} (refs: {len(multi_kerchunk.get("refs", multi_kerchunk))})')
-        if parquet_path_no_cat :
-            df.refs_to_dataframe(multi_kerchunk, output_fname, categorical_threshold=record_size)
-        else :
-            df.refs_to_dataframe(multi_kerchunk, output_fname)
+        df.refs_to_dataframe(multi_kerchunk, output_fname, record_size=record_size, categorical_threshold=record_size)
         print(f'Created: {output_fname}')
 
         if make_remote:
             import convert_ref_file_loc
-            if parquet_path_no_cat :
-                convert_ref_file_loc.main_parquet(multi_kerchunk, output_fname.replace(file_extension,f'-remote{file_extension}'), categorical_threshold=record_size)
-            else :
-                convert_ref_file_loc.main_parquet(multi_kerchunk, output_fname.replace(file_extension,f'-remote{file_extension}'))
+            convert_ref_file_loc.main_parquet(multi_kerchunk, output_fname.replace(file_extension,f'-remote{file_extension}'))
 
 
 def process_kerchunk_combine(
@@ -707,9 +725,9 @@ def process_kerchunk_combine(
     output_filename="",
     make_remote=False,
     concat_new_dim=None,
+    h5_coord_group=None,
     output_format="json",
-    use_dask=True,
-    parquet_path_no_cat=False
+    use_dask=True
 ):
     """Traverse files in `directory` and create kerchunk aggregated files."""
 
@@ -748,9 +766,17 @@ def process_kerchunk_combine(
 
     # If concatenating ensemble members, extract member id from filename.
     if concat_new_dim == "ensemble":
-        member_ids = concat_dim.get_ensemble(files)
+        member_ids = helpers.get_ensemble(files)
 
-    time_varname = get_time_variable(files[0])
+    # If coordinates exist in a group, prepend the group name to the variables for concat.
+    if h5_coord_group:
+        lat_dim = f"{h5_coord_group}/lat"
+        lon_dim = f"{h5_coord_group}/lon"
+    else:
+        lat_dim = 'lat'
+        lon_dim = 'lon'        
+
+    time_varname = get_time_variable(files[0], h5_coord_group)
     # check if time variable name is found
     if time_varname is None:
         print('Could not determine time variable name')
@@ -809,6 +835,7 @@ def process_kerchunk_combine(
         mzz = MultiZarrToZarr(
                all_refs,
                concat_dims=[time_varname],
+               identical_dims=[lat_dim, lon_dim],  
                #coo_map='QSNOW',
               )
     elif concat_new_dim == "ensemble":
@@ -822,6 +849,11 @@ def process_kerchunk_combine(
     print('create aggregated reference')
     multi_kerchunk = mzz.translate()
 
+    # Adjust metadata to eliminate HDF5 groups if they exist.
+    groups = helpers.get_groups_from_refs(multi_kerchunk)
+    if groups:
+        multi_kerchunk = helpers.strip_all_group_prefixes(multi_kerchunk, groups)
+
     print('writing combined kerchunk reference')
     write_combined_kerchunk(
         output_directory,
@@ -829,8 +861,7 @@ def process_kerchunk_combine(
         regex,
         output_filename,
         output_format,
-        make_remote,
-        parquet_path_no_cat
+        make_remote
     )
 
 
@@ -890,9 +921,9 @@ def main():
             output_filename=args.filename,
             make_remote=args.make_remote,
             concat_new_dim=args.concat_new_dim,
+            h5_coord_group=args.h5_coord_group,
             output_format=args.output_format[0],
-            use_dask=args.cluster[0].lower() != 'serial',
-            parquet_path_no_cat=args.parquet_path_no_cat
+            use_dask=args.cluster[0].lower() != 'serial'
         )
     else:
         print(f'action type "{args.action}" not recognized')
