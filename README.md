@@ -569,6 +569,10 @@ cat /scratch/verify.log
 
 ## Special Dataset Considerations
 
+- **Special Versions of ``create_kerchunk.py``**
+
+The [patches](patches) folder exists for hosting special versions of ``create_kerchunk.py`` that are not needed in most cases.   The extra code needed to handle these cases can be substantial.   Because merging these features into the main codebase would increase code complexity, we store these special cases in the [patches](patches) folder.
+
 - **MMLEA2 Dataset** (d651039)
 
 This dataset consists of simulation runs from many different climate models, including some that produced NetCDF3 output.   The original NETCDF3 data files were not chunked, meaning that it can take minutes to open one of the reference files containing NetCDF3 data.
